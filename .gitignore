@@ -11,3 +11,4 @@ data/*.json
 assets/screenshots/
 dist/
 build/
+data/*.pdf

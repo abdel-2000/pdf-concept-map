@@ -1,12 +1,12 @@
 """
-app.py — PDF Concept Map Generator
-Gradio interface: upload PDF → choose language & model → view concept map.
+app.py — PDF Concept Map Generator + RAG Assistant
+Gradio interface: upload PDF → choose language & model → view concept map,
+OR upload PDF → ask questions with RAG (pgvector + Ollama).
 Author: Abdellatif El Majdoubi
 GitHub: https://github.com/abdel-2000
 """
 
 import json
-import tempfile
 import os
 
 import gradio as gr
@@ -16,9 +16,11 @@ import io
 from pdf_extractor import extract_text
 from llm_mapper import generate_map
 from graph_renderer import render_graph
+from ingest import ingest_pdf
+from rag import answer_question
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+# ── Helpers: Concept Map (existing) ─────────────────────────────────────────
 
 def process_pdf(pdf_file, language: str, model: str, max_chars: int):
     """Full pipeline: PDF → text → LLM → graph image + JSON."""
@@ -26,7 +28,6 @@ def process_pdf(pdf_file, language: str, model: str, max_chars: int):
         return None, "⚠️ Please upload a PDF file.", ""
 
     try:
-        # 1. Extract text
         result = extract_text(pdf_file.name, max_chars=int(max_chars))
         text   = result["text"]
         lang_hint = result["language_hint"]
@@ -41,16 +42,10 @@ def process_pdf(pdf_file, language: str, model: str, max_chars: int):
             + ("⚠️ Text was truncated." if result["truncated"] else "")
         )
 
-        # Use detected language if auto
         effective_lang = lang_hint if language == "auto" else language
-
-        # 2. Generate concept map via LLM
         concept_map = generate_map(text, language=effective_lang, model=model)
-
-        # 3. Render graph
         png_bytes = render_graph(concept_map)
         image = Image.open(io.BytesIO(png_bytes))
-
         json_out = json.dumps(concept_map, ensure_ascii=False, indent=2)
         return image, status, json_out
 
@@ -65,7 +60,6 @@ def process_pdf(pdf_file, language: str, model: str, max_chars: int):
 
 
 def check_ollama():
-    """Check if Ollama is running and return status string."""
     import requests
     try:
         r = requests.get("http://localhost:11434/api/tags", timeout=3)
@@ -77,6 +71,32 @@ def check_ollama():
         return "❌ Ollama not running. Start it with: `ollama serve`"
 
 
+# ── Helpers: RAG (new) ──────────────────────────────────────────────────────
+
+def rag_upload(pdf_file):
+    """Ingest a PDF into the RAG vector database (chunk + embed + store)."""
+    if pdf_file is None:
+        return "⚠️ Carica prima un PDF."
+    try:
+        filename = os.path.basename(pdf_file.name)
+        ingest_pdf(pdf_file.name, source_name=filename)
+        return f"✅ Documento **{filename}** caricato e indicizzato. Ora puoi fare domande su questo PDF."
+    except Exception as e:
+        return f"❌ Errore durante il caricamento: {e}"
+
+
+def rag_ask(question):
+    """Answer a question using RAG (retrieval + Ollama generation)."""
+    if not question or not question.strip():
+        return "⚠️ Scrivi una domanda.", ""
+    try:
+        answer, sources = answer_question(question)
+        sources_md = "\n".join(f"- {s}" for s in sources) if sources else "Nessuna fonte trovata."
+        return answer, sources_md
+    except Exception as e:
+        return f"❌ Errore: {e}", ""
+
+
 # ── Gradio UI ─────────────────────────────────────────────────────────────
 
 CSS = """
@@ -86,75 +106,98 @@ footer { display: none; }
 """
 
 with gr.Blocks(
-    title="PDF Concept Map Generator",
+    title="PDF Concept Map & RAG Assistant",
     theme=gr.themes.Soft(primary_hue="blue"),
     css=CSS,
 ) as demo:
 
     gr.Markdown("""
-    # 🗺️ PDF Concept Map Generator
-    Upload a PDF → choose language → get an interactive concept map powered by a local LLM (Ollama).
+    # 🗺️ PDF Concept Map & RAG Assistant
+    Two ways to explore a PDF: generate a visual concept map, or ask direct questions using RAG
+    (retrieval-augmented generation with PostgreSQL + pgvector + Ollama).
 
     **Supports:** 🇮🇹 Italian · 🇸🇦 Arabic · 🇬🇧 English
     """)
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            pdf_input = gr.File(
-                label="📄 Upload PDF",
-                file_types=[".pdf"],
-            )
-            language = gr.Radio(
-                choices=["auto", "italian", "arabic", "english"],
-                value="auto",
-                label="🌐 Output language",
-                info="'auto' detects Italian / Arabic / English automatically.",
-            )
-            model = gr.Textbox(
-                value="llama3",
-                label="🤖 Ollama model",
-                info="Must be installed locally. Run: ollama pull llama3",
-            )
-            max_chars = gr.Slider(
-                minimum=1000, maximum=12000, value=6000, step=500,
-                label="📏 Max characters extracted",
-                info="Reduce if the model is slow or runs out of memory.",
-            )
-            btn = gr.Button("🚀 Generate concept map", variant="primary")
+    with gr.Tabs():
 
-            ollama_status = gr.Markdown(check_ollama())
-            gr.Button("🔄 Check Ollama status", size="sm").click(
-                fn=check_ollama, outputs=ollama_status
+        # ── TAB 1: Concept Map (existing feature) ──────────────────────
+        with gr.Tab("🗺️ Mappa Concettuale"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    pdf_input = gr.File(label="📄 Upload PDF", file_types=[".pdf"])
+                    language = gr.Radio(
+                        choices=["auto", "italian", "arabic", "english"],
+                        value="auto", label="🌐 Output language",
+                        info="'auto' detects Italian / Arabic / English automatically.",
+                    )
+                    model = gr.Textbox(
+                        value="llama3", label="🤖 Ollama model",
+                        info="Must be installed locally. Run: ollama pull llama3",
+                    )
+                    max_chars = gr.Slider(
+                        minimum=1000, maximum=12000, value=6000, step=500,
+                        label="📏 Max characters extracted",
+                    )
+                    btn = gr.Button("🚀 Generate concept map", variant="primary")
+                    ollama_status = gr.Markdown(check_ollama())
+                    gr.Button("🔄 Check Ollama status", size="sm").click(
+                        fn=check_ollama, outputs=ollama_status
+                    )
+
+                with gr.Column(scale=2):
+                    graph_out  = gr.Image(label="🗺️ Concept Map", type="pil")
+                    status_out = gr.Markdown(label="Status")
+                    json_out   = gr.Code(label="📋 Raw JSON", language="json", visible=True)
+
+            btn.click(
+                fn=process_pdf,
+                inputs=[pdf_input, language, model, max_chars],
+                outputs=[graph_out, status_out, json_out],
             )
 
-        with gr.Column(scale=2):
-            graph_out  = gr.Image(label="🗺️ Concept Map", type="pil")
-            status_out = gr.Markdown(label="Status")
-            json_out   = gr.Code(
-                label="📋 Raw JSON (concept map)",
-                language="json",
-                visible=True,
-            )
+        # ── TAB 2: Chiedi al PDF (RAG, new) ─────────────────────────────
+        with gr.Tab("💬 Chiedi al PDF (RAG)"):
+            gr.Markdown("""
+            Carica un PDF, poi fai domande dirette sul suo contenuto.
+            Il sistema usa **retrieval semantico (PostgreSQL + pgvector)** per trovare
+            i passaggi più rilevanti e li passa a **Ollama** per generare la risposta.
+            """)
+            with gr.Row():
+                with gr.Column(scale=1):
+                    rag_pdf_input = gr.File(label="📄 Upload PDF", file_types=[".pdf"])
+                    rag_upload_btn = gr.Button("📥 Carica ed indicizza documento", variant="primary")
+                    rag_upload_status = gr.Markdown()
 
-    btn.click(
-        fn=process_pdf,
-        inputs=[pdf_input, language, model, max_chars],
-        outputs=[graph_out, status_out, json_out],
-    )
+                with gr.Column(scale=2):
+                    rag_question = gr.Textbox(
+                        label="❓ La tua domanda",
+                        placeholder="Es: Cos'è l'intelligenza artificiale?",
+                        lines=2,
+                    )
+                    rag_ask_btn = gr.Button("🔍 Chiedi", variant="primary")
+                    rag_answer = gr.Markdown(label="Risposta")
+                    rag_sources = gr.Markdown(label="Fonti")
+
+            rag_upload_btn.click(
+                fn=rag_upload,
+                inputs=[rag_pdf_input],
+                outputs=[rag_upload_status],
+            )
+            rag_ask_btn.click(
+                fn=rag_ask,
+                inputs=[rag_question],
+                outputs=[rag_answer, rag_sources],
+            )
 
     gr.Markdown("""
     ---
     ### ℹ️ How to use
-    1. Install Ollama: [ollama.com](https://ollama.com)
-    2. Pull a model: `ollama pull llama3`
-    3. Start Ollama: `ollama serve`
-    4. Upload a PDF and click **Generate**
+    **Concept Map**: upload a PDF → click Generate → get a visual graph.
+    **RAG Chat**: upload a PDF → click "Carica ed indicizza" → ask any question about it.
 
-    ### ⚠️ Limitations
-    - Requires Ollama running locally (no internet needed)
-    - Large PDFs are truncated to avoid token overflow
-    - Arabic PDF extraction quality depends on the PDF encoding
-    - Map quality depends on the chosen model
+    ### Stack
+    Python · Gradio · Ollama · PostgreSQL + pgvector · sentence-transformers · PyMuPDF · Docker
 
     ---
     *Built by [Abdellatif El Majdoubi](https://github.com/abdel-2000) · UNINETTUNO 2025/2026*
